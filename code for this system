@@ -1,0 +1,215 @@
+#include <ESP8266WiFi.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// Pin definitions for ESP8266 (NodeMCU)
+#define SS_PIN  4   // D2 (GPIO 4, MFRC522 SS)
+#define RST_PIN 5   // D1 (GPIO 5, MFRC522 RST)
+// Hardware SPI pins (fixed): SCK = GPIO 14 (D5), MOSI = GPIO 13 (D7), MISO = GPIO 12 (D6)
+#define OLED_SDA 0  // D3 (GPIO 0, I2C SDA)
+#define OLED_SCL 2  // D4 (GPIO 2, I2C SCL)
+
+// OLED display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Initialize MFRC522
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// Wi-Fi and Google Sheets configuration
+const char* ssid = "OPPO"; // Replace with your Wi-Fi SSID
+const char* password = "Mayank92"; // Replace with your Wi-Fi password
+const char* scriptURL = "YOUR_SCRIPT_URL"; // Replace with Google Apps Script URL
+
+// Registered UID-name pairs
+struct User {
+  String uid;
+  String name;
+};
+User registeredUsers[] = {
+  {"2830b64b", "Mayank"},
+  {"336e15da", "Lovish"}
+};
+const int numUsers = 2;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial); // Wait for Serial to initialize
+  Serial.println("RFID Attendance System Starting...");
+
+  // Initialize I2C for OLED
+  Wire.begin(OLED_SDA, OLED_SCL);
+  
+  // Initialize OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Try address 0x3C
+    Serial.println(F("OLED initialization failed at 0x3C, trying 0x3D..."));
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+      Serial.println(F("OLED initialization failed. Continuing without OLED..."));
+    } else {
+      initializeOLED();
+    }
+  } else {
+    initializeOLED();
+  }
+
+  // Initialize SPI
+  SPI.begin();
+  Serial.println("SPI initialized");
+
+  // Initialize MFRC522
+  mfrc522.PCD_Init();
+  Serial.println("MFRC522 initialized");
+  mfrc522.PCD_DumpVersionToSerial();
+  Serial.println("RFID Test: Scan a card...");
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi Connection Failed");
+  }
+}
+
+void loop() {
+  // Check for new RFID card
+  if (!mfrc522.PICC_IsNewCardPresent()) {
+    Serial.println("No card detected");
+    delay(500);
+    return;
+  }
+  Serial.println("Card detected, attempting to read...");
+  if (!mfrc522.PICC_ReadCardSerial()) {
+    Serial.println("Failed to read card");
+    return;
+  }
+
+  // Read UID
+  String uid = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uid += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+    uid += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uid.toLowerCase();
+
+  // Find user name
+  String name = "Unknown";
+  for (int i = 0; i < numUsers; i++) {
+    if (uid == registeredUsers[i].uid) {
+      name = registeredUsers[i].name;
+      break;
+    }
+  }
+
+  // Display on OLED
+  Serial.println("Updating OLED with UID: " + uid + " | Name: " + name);
+  updateOLED(uid, name);
+
+  // Output to Serial
+  Serial.println("UID: " + uid + " | Name: " + name);
+  sendToSheet(uid, name);
+
+  // Halt card
+  mfrc522.PICC_HaltA();
+  delay(3000);
+
+  // Reset OLED to default message
+  Serial.println("Resetting OLED to default message");
+  resetOLED();
+}
+
+void initializeOLED() {
+  Serial.println("OLED initialized");
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("RFID Attendance");
+  display.println("Scan Your Card...");
+  display.display();
+}
+
+void updateOLED(String uid, String name) {
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C) || display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("RFID Attendance");
+    display.setCursor(0, 20);
+    display.print("UID: ");
+    display.println(uid);
+    display.setCursor(0, 40);
+    display.print("Welcome, ");
+    display.println(name + "!");
+    display.display();
+  } else {
+    Serial.println("OLED not available, skipping display update");
+  }
+}
+
+void resetOLED() {
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C) || display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("RFID Attendance");
+    display.println("Scan Your Card...");
+    display.display();
+  }
+}
+
+void sendToSheet(String uid, String name) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, skipping Google Sheets update");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Note: Use with caution; consider certificate validation for production
+
+  if (client.connect("script.google.com", 443)) {
+    String json;
+    StaticJsonDocument<200> doc;
+    doc["uid"] = uid;
+    doc["name"] = name;
+    doc["timestamp"] = String(millis());
+    serializeJson(doc, json);
+
+    String request = String("POST ") + scriptURL + " HTTP/1.1\r\n" +
+                     "Host: script.google.com\r\n" +
+                     "Content-Type: application/json\r\n" +
+                     "Content-Length: " + json.length() + "\r\n" +
+                     "\r\n" +
+                     json;
+
+    client.print(request);
+    Serial.println("Sending data to Google Sheets: " + json);
+
+    unsigned long timeout = millis();
+    while (client.available() == 0) {
+      if (millis() - timeout > 5000) {
+        Serial.println("Client timeout");
+        client.stop();
+        return;
+      }
+    }
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      Serial.println(line);
+    }
+    client.stop();
+  } else {
+    Serial.println("Connection to Google Sheets failed");
+  }
+}
